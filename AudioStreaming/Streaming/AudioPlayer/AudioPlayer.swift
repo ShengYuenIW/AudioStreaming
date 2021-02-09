@@ -80,6 +80,11 @@ public final class AudioPlayer {
         }
         return entry.progress
     }
+    
+    /// The main mixer node of engine
+    public var mainMixerNode: AVAudioMixerNode {
+        get { audioEngine.mainMixerNode }
+    }
 
     public private(set) var customAttachedNodes = [AVAudioNode]()
 
