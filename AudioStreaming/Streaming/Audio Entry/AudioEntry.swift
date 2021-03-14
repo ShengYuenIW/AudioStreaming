@@ -109,7 +109,7 @@ internal class AudioEntry {
             if packetsCount > estimationMinPacketsPreferred ||
                 (audioStreamFormat.mBytesPerFrame == 0 && packetsCount > estimationMinPackets)
             {
-                return avaragePacketByteSize / packetDuration * 8
+                return ((avaragePacketByteSize / packetDuration * 8) / 1000).rounded() * 1000
             }
         }
         return (Double(audioStreamFormat.mBytesPerFrame) * audioStreamFormat.mSampleRate) * 8
