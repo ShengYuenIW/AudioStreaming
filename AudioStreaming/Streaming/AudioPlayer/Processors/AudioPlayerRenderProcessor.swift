@@ -90,7 +90,7 @@ final class AudioPlayerRenderProcessor: NSObject {
                     waitForBuffer = true
                 }
             } else if state == .waitingForDataAfterSeek {
-                var requiredFramesToStart: Int = 1024
+                var requiredFramesToStart = 1024
                 if framesState.lastFrameQueued >= 0 {
                     requiredFramesToStart = min(requiredFramesToStart, framesState.lastFrameQueued - framesState.queued)
                 }
@@ -109,14 +109,12 @@ final class AudioPlayerRenderProcessor: NSObject {
                 bufferList.mBuffers.mDataByteSize = frameSizeInBytes * framesToCopy
 
                 if isMuted {
-                    writeSilence(outputBuffer: &bufferList.mBuffers,
-                                 outputBufferSize: 0,
-                                 offset: Int(bufferList.mBuffers.mDataByteSize))
+                    if let mData = bufferList.mBuffers.mData {
+                        memset(mData, 0, Int(bufferList.mBuffers.mDataByteSize))
+                    }
                 } else {
                     if let mDataBuffer = audioBuffer.mData {
-                        memcpy(bufferList.mBuffers.mData,
-                               mDataBuffer + Int(start * frameSizeInBytes),
-                               Int(bufferList.mBuffers.mDataByteSize))
+                        memcpy(bufferList.mBuffers.mData, mDataBuffer + Int(start * frameSizeInBytes), Int(bufferList.mBuffers.mDataByteSize))
                     }
                 }
                 totalFramesCopied = framesToCopy
@@ -132,14 +130,12 @@ final class AudioPlayerRenderProcessor: NSObject {
                 bufferList.mBuffers.mDataByteSize = frameSizeInBytes * frameToCopy
 
                 if isMuted {
-                    writeSilence(outputBuffer: &bufferList.mBuffers,
-                                 outputBufferSize: 0,
-                                 offset: Int(bufferList.mBuffers.mDataByteSize))
+                    if let mData = bufferList.mBuffers.mData {
+                        memset(mData, 0, Int(bufferList.mBuffers.mDataByteSize))
+                    }
                 } else {
                     if let mDataBuffer = audioBuffer.mData {
-                        memcpy(bufferList.mBuffers.mData,
-                               mDataBuffer + Int(start * frameSizeInBytes),
-                               Int(bufferList.mBuffers.mDataByteSize))
+                        memcpy(bufferList.mBuffers.mData, mDataBuffer + Int(start * frameSizeInBytes), Int(bufferList.mBuffers.mDataByteSize))
                     }
                 }
 
@@ -151,14 +147,10 @@ final class AudioPlayerRenderProcessor: NSObject {
                     bufferList.mBuffers.mDataByteSize += frameSizeInBytes * moreFramesToCopy
                     if let ioBufferData = bufferList.mBuffers.mData {
                         if isMuted {
-                            writeSilence(outputBuffer: &bufferList.mBuffers,
-                                         outputBufferSize: Int(frameSizeInBytes * moreFramesToCopy),
-                                         offset: Int(frameToCopy * frameSizeInBytes))
+                            memset(ioBufferData + Int(frameToCopy * frameSizeInBytes), 0, Int(frameSizeInBytes * moreFramesToCopy))
                         } else {
                             if let mDataBuffer = audioBuffer.mData {
-                                memcpy(ioBufferData + Int(frameToCopy * frameSizeInBytes),
-                                       mDataBuffer,
-                                       Int(frameSizeInBytes * moreFramesToCopy))
+                                memcpy(ioBufferData + Int(frameToCopy * frameSizeInBytes), mDataBuffer, Int(frameSizeInBytes * moreFramesToCopy))
                             }
                         }
                     }
@@ -179,9 +171,9 @@ final class AudioPlayerRenderProcessor: NSObject {
 
         if totalFramesCopied < inNumberFrames {
             let delta = inNumberFrames - totalFramesCopied
-            writeSilence(outputBuffer: &bufferList.mBuffers,
-                         outputBufferSize: Int(delta * frameSizeInBytes),
-                         offset: Int(totalFramesCopied * frameSizeInBytes))
+            if let mData = bufferList.mBuffers.mData {
+                memset(mData + Int(totalFramesCopied * frameSizeInBytes), 0, Int(delta * frameSizeInBytes))
+            }
 
             if playingEntry != nil || AudioPlayer.InternalState.waiting.contains(state) {
                 if playerContext.internalState != .rebuffering {
@@ -198,7 +190,6 @@ final class AudioPlayerRenderProcessor: NSObject {
                                 state.contains(.running) && state != .playing
                             }
                         }
-                        rendererContext.waitingForDataAfterSeekFrameCount.write { $0 = 0 }
                     }
                 } else {
                     rendererContext.waitingForDataAfterSeekFrameCount.write { $0 = 0 }
@@ -211,7 +202,7 @@ final class AudioPlayerRenderProcessor: NSObject {
         }
         currentPlayingEntry.lock.lock()
 
-        var extraFramesPlayedNotAssigned: Int = 0
+        var extraFramesPlayedNotAssigned = 0
         var framesPlayedForCurrent = Int(totalFramesCopied)
 
         if currentPlayingEntry.framesState.lastFrameQueued >= 0 {
@@ -273,10 +264,11 @@ final class AudioPlayerRenderProcessor: NSObject {
         return UnsafePointer(rendererContext.inOutAudioBufferList)
     }
 
-    func render(inNumberFrames: UInt32,
-                ioData: UnsafeMutablePointer<AudioBufferList>,
-                flags _: UnsafeMutablePointer<AudioUnitRenderActionFlags>) -> OSStatus
-    {
+    func render(
+        inNumberFrames: UInt32,
+        ioData: UnsafeMutablePointer<AudioBufferList>,
+        flags _: UnsafeMutablePointer<AudioUnitRenderActionFlags>
+    ) -> OSStatus {
         var status = noErr
 
         rendererContext.inOutAudioBufferList[0].mBuffers.mData = ioData.pointee.mBuffers.mData
@@ -311,24 +303,18 @@ final class AudioPlayerRenderProcessor: NSObject {
         return status
     }
 
-    func renderProvider(flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
-                        timeStamp _: UnsafePointer<AudioTimeStamp>,
-                        inNumberFrames: AUAudioFrameCount,
-                        inputBusNumber: Int,
-                        inputData: UnsafeMutablePointer<AudioBufferList>) -> AUAudioUnitStatus
-    {
+    func renderProvider(
+        flags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
+        timeStamp _: UnsafePointer<AudioTimeStamp>,
+        inNumberFrames: AUAudioFrameCount,
+        inputBusNumber: Int,
+        inputData: UnsafeMutablePointer<AudioBufferList>
+    ) -> AUAudioUnitStatus {
         guard inputBusNumber == 0 else { return noErr }
-        return render(inNumberFrames: inNumberFrames, ioData: inputData, flags: flags)
-    }
-
-    @inline(__always)
-    private func writeSilence(outputBuffer: inout AudioBuffer,
-                              outputBufferSize: Int,
-                              offset: Int)
-    {
-        guard let mData = outputBuffer.mData else { return }
-        memset(mData + offset, 0, outputBufferSize)
-        outputBuffer.mDataByteSize = UInt32(outputBufferSize)
-        outputBuffer.mNumberChannels = outputAudioFormat.mChannelsPerFrame
+        return render(
+            inNumberFrames: inNumberFrames,
+            ioData: inputData,
+            flags: flags
+        )
     }
 }

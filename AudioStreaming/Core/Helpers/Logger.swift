@@ -8,7 +8,7 @@ import os
 
 private let loggingSubsystem = "audio.streaming.log"
 
-internal enum Logger {
+enum Logger {
     private static let audioRendering = OSLog(subsystem: loggingSubsystem, category: "audio.rendering")
     private static let networking = OSLog(subsystem: loggingSubsystem, category: "audio.networking")
     private static let generic = OSLog(subsystem: loggingSubsystem, category: "audio.streaming.generic")
@@ -31,7 +31,7 @@ internal enum Logger {
     }
 
     static func error(_ message: StaticString, category: Category, args: CVarArg...) {
-        proccess(message, category: category, type: .error, args: args)
+        process(message, category: category, type: .error, args: args)
     }
 
     static func error(_ message: StaticString, category: Category) {
@@ -39,14 +39,14 @@ internal enum Logger {
     }
 
     static func debug(_ message: StaticString, category: Category, args: CVarArg...) {
-        proccess(message, category: category, type: .debug, args: args)
+        process(message, category: category, type: .debug, args: args)
     }
 
     static func debug(_ message: StaticString, category: Category) {
         debug(message, category: category, args: [])
     }
 
-    private static func proccess(_ message: StaticString, category: Category, type: OSLogType, args: CVarArg...) {
+    private static func process(_ message: StaticString, category: Category, type: OSLogType, args: CVarArg...) {
         guard isEnabled else { return }
         os_log(message, log: category.toOSLog(), type: type, args)
     }

@@ -7,11 +7,11 @@ import AudioToolbox
 import AVFoundation
 
 public struct AudioEntryId: Equatable {
-    internal var unique = UUID()
+    var unique = UUID()
     public var id: String
 }
 
-internal class AudioEntry {
+class AudioEntry {
     private let estimationMinPackets = 2
     private let estimationMinPacketsPreferred = 64
 
@@ -22,9 +22,7 @@ internal class AudioEntry {
     let id: AudioEntryId
 
     /// The sample rate from the `audioStreamFormat`
-    var sampleRate: Float {
-        Float(audioStreamFormat.mSampleRate)
-    }
+    var sampleRate: Float
 
     var audioFileHint: AudioFileTypeID {
         source.audioFileHint
@@ -49,11 +47,9 @@ internal class AudioEntry {
     private(set) var framesState: EntryFramesState
     private(set) var processedPacketsState: ProcessedPacketsState
 
-    var packetDuration: Double {
-        return Double(audioStreamFormat.mFramesPerPacket) / Double(sampleRate)
-    }
+    var packetDuration: Double
 
-    private var avaragePacketByteSize: Double {
+    private var averagePacketByteSize: Double {
         let packets = processedPacketsState
         guard !packets.isEmpty else { return 0 }
         return Double(packets.sizeTotal / packets.count)
@@ -72,6 +68,8 @@ internal class AudioEntry {
         processedPacketsState = ProcessedPacketsState()
         framesState = EntryFramesState()
         audioStreamState = AudioStreamState()
+        sampleRate = 0
+        packetDuration = 0
     }
 
     func close() {
@@ -94,7 +92,9 @@ internal class AudioEntry {
 
     func reset() {
         lock.lock(); defer { lock.unlock() }
-        framesState = EntryFramesState()
+        framesState.played = 0
+        framesState.queued = 0
+        framesState.lastFrameQueued = -1
     }
 
     func has(same source: CoreAudioStreamSource) -> Bool {
@@ -109,7 +109,7 @@ internal class AudioEntry {
             if packetsCount > estimationMinPacketsPreferred ||
                 (audioStreamFormat.mBytesPerFrame == 0 && packetsCount > estimationMinPackets)
             {
-                return ((avaragePacketByteSize / packetDuration * 8) / 1000).rounded() * 1000
+                return ((averagePacketByteSize / packetDuration * 8) / 1000).rounded() * 1000
             }
         }
         return (Double(audioStreamFormat.mBytesPerFrame) * audioStreamFormat.mSampleRate) * 8
@@ -121,15 +121,21 @@ internal class AudioEntry {
     }
 
     func duration() -> Double {
-        guard sampleRate > 0 else { return 0 }
+        lock.lock()
+        guard sampleRate > 0 else {
+            lock.unlock()
+            return 0
+        }
 
         if let audioDataPacketOffset = audioStreamState.dataPacketOffset {
             let framesPerPacket = UInt64(audioStreamFormat.mFramesPerPacket)
             if audioDataPacketOffset > 0, framesPerPacket > 0 {
-                return Double(audioDataPacketOffset * framesPerPacket) / audioStreamFormat.mSampleRate
+                let duration = Double(audioDataPacketOffset * framesPerPacket) / audioStreamFormat.mSampleRate
+                lock.unlock()
+                return duration
             }
         }
-
+        lock.unlock()
         let calculatedBitrate = self.calculatedBitrate()
         if calculatedBitrate < 1.0 || source.length == 0 {
             return 0
@@ -151,12 +157,12 @@ extension AudioEntry: AudioStreamSourceDelegate {
         delegate?.dataAvailable(source: source, data: data)
     }
 
-    func errorOccured(source: CoreAudioStreamSource, error: Error) {
-        delegate?.errorOccured(source: source, error: error)
+    func errorOccurred(source: CoreAudioStreamSource, error: Error) {
+        delegate?.errorOccurred(source: source, error: error)
     }
 
-    func endOfFileOccured(source: CoreAudioStreamSource) {
-        delegate?.endOfFileOccured(source: source)
+    func endOfFileOccurred(source: CoreAudioStreamSource) {
+        delegate?.endOfFileOccurred(source: source)
     }
 
     func metadataReceived(data: [String: String]) {

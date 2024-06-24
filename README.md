@@ -1,4 +1,4 @@
-![AudioStreaming CI](https://github.com/dimitris-c/AudioStreaming/workflows/AudioStreaming%20CI/badge.svg)
+[![AudioStreaming CI](https://github.com/dimitris-c/AudioStreaming/actions/workflows/swift.yml/badge.svg)](https://github.com/dimitris-c/AudioStreaming/actions/workflows/swift.yml)
 
 # AudioStreaming
 An AudioPlayer/Streaming library for iOS written in Swift, allows playback of online audio streaming, local file as well as gapless queueing.
@@ -8,14 +8,16 @@ Under the hood `AudioStreaming` uses `AVAudioEngine` and `CoreAudio` for playbac
 #### Supported audio
 - Online streaming (Shoutcast/ICY streams) with metadata parsing
 - AIFF, AIFC, WAVE, CAF, NeXT, ADTS, MPEG Audio Layer 3, AAC audio formats
-- M4A (_Optimized files only_)
+- M4A
+
+As of 1.2.0 version, there's support for non-optimized M4A, please report any issues
 
 Known limitations: 
-- As described above non-optimised M4A files are not supported this is a limitation of [AudioFileStream Services](https://developer.apple.com/documentation/audiotoolbox/audio_file_stream_services?language=swift)
+~~- As described above non-optimised M4A files are not supported this is a limitation of [AudioFileStream Services](https://developer.apple.com/documentation/audiotoolbox/audio_file_stream_services?language=swift)~~
 
 
 # Requirements
- - iOS 12.0+
+ - iOS 13.0+
  - Swift 5.x
 
 # Using AudioStreaming

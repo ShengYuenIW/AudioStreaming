@@ -8,6 +8,10 @@ import AVFoundation
 import Foundation
 import Network
 
+enum RemoteAudioSourceError: Error {
+    case mp4NotSeekable
+}
+
 public class RemoteAudioSource: AudioStreamSource {
     weak var delegate: AudioStreamSourceDelegate?
 
@@ -31,23 +35,25 @@ public class RemoteAudioSource: AudioStreamSource {
     private var seekOffset: Int
     private var supportsSeek: Bool
 
-    internal var metadataStreamProcessor: MetadataStreamSource
+    var metadataStreamProcessor: MetadataStreamSource
 
     private var shouldTryParsingIcycastHeaders: Bool = false
     private let icycastHeadersProcessor: IcycastHeadersProcessor
 
-    internal var audioFileHint: AudioFileTypeID {
+    var audioFileHint: AudioFileTypeID {
         guard let output = parsedHeaderOutput, output.typeId != 0 else {
             return audioFileType(fileExtension: url.pathExtension)
         }
         return output.typeId
     }
 
-    internal let underlyingQueue: DispatchQueue
-    internal let streamOperationQueue: OperationQueue
-    internal let netStatusService: NetStatusProvider
-    internal var waitingForNetwork = false
-    internal let retrierTimeout: Retrier
+    private let mp4Restructure: RemoteMp4Restructure
+
+    let underlyingQueue: DispatchQueue
+    let streamOperationQueue: OperationQueue
+    let netStatusService: NetStatusProvider
+    var waitingForNetwork = false
+    let retrierTimeout: Retrier
 
     init(networking: NetworkingClient,
          metadataStreamSource: MetadataStreamSource,
@@ -74,6 +80,7 @@ public class RemoteAudioSource: AudioStreamSource {
         streamOperationQueue.isSuspended = true
         streamOperationQueue.name = "remote.audio.source.data.stream.queue"
         retrierTimeout = retrier
+        mp4Restructure = RemoteMp4Restructure(url: url, networking: networkingClient)
         startNetworkService()
     }
 
@@ -86,12 +93,12 @@ public class RemoteAudioSource: AudioStreamSource {
         let metadataProcessor = MetadataStreamProcessor(parser: metadataParser.eraseToAnyParser())
         let netStatusProvider = NetStatusService(network: NWPathMonitor())
         let icyheaderProcessor = IcycastHeadersProcessor()
-        let retrierTimout = Retrier(interval: .seconds(1), maxInterval: 5, underlyingQueue: nil)
+        let retrierTimeout = Retrier(interval: .seconds(1), maxInterval: 5, underlyingQueue: nil)
         self.init(networking: networking,
                   metadataStreamSource: metadataProcessor,
                   icycastHeadersProcessor: icyheaderProcessor,
                   netStatusProvider: netStatusProvider,
-                  retrier: retrierTimout,
+                  retrier: retrierTimeout,
                   url: url,
                   underlyingQueue: underlyingQueue,
                   httpHeaders: httpHeaders)
@@ -109,8 +116,7 @@ public class RemoteAudioSource: AudioStreamSource {
 
     func close() {
         retrierTimeout.cancel()
-        netStatusService.stop()
-        streamOperationQueue.isSuspended = true
+        streamOperationQueue.isSuspended = false
         streamOperationQueue.cancelAllOperations()
         if let streamTask = streamRequest {
             streamTask.cancel()
@@ -129,6 +135,7 @@ public class RemoteAudioSource: AudioStreamSource {
             return
         }
 
+        mp4Restructure.clear()
         retrierTimeout.cancel()
         metadataStreamProcessor.reset()
         icycastHeadersProcessor.reset()
@@ -138,12 +145,10 @@ public class RemoteAudioSource: AudioStreamSource {
     }
 
     func suspend() {
-        streamRequest?.suspend()
         streamOperationQueue.isSuspended = true
     }
 
     func resume() {
-        streamRequest?.resume()
         streamOperationQueue.isSuspended = false
     }
 
@@ -154,24 +159,77 @@ public class RemoteAudioSource: AudioStreamSource {
             guard let self = self else { return }
             guard connection.isConnected else { return }
             if self.waitingForNetwork {
+                self.seek(at: self.supportsSeek ? self.position : 0)
                 self.waitingForNetwork = false
-                self.seek(at: self.position)
             }
         }
     }
 
     private func performOpen(seek seekOffset: Int) {
-        let urlRequest = buildUrlRequest(with: url, seekIfNeeded: seekOffset)
+        if seekOffset == 0 {
+            initialRequest { [weak self] in
+                guard let self else { return }
+                if self.parsedHeaderOutput?.isMp4 == true {
+                    self.handleMp4Files()
+                } else {
+                    self.doPerfomOpen(seek: 0)
+                }
+            }
+        } else {
+            if mp4Restructure.dataOptimized {
+                let adjustedOffset = mp4Restructure.seekAdjusted(offset: seekOffset)
+                doPerfomOpen(seek: adjustedOffset)
+            } else {
+                doPerfomOpen(seek: seekOffset)
+            }
+        }
+    }
 
-        let request = networkingClient.stream(request: urlRequest)
+    private func doPerfomOpen(seek seekOffset: Int) {
+        let urlRequest = buildUrlRequest(with: url, seekIfNeeded: seekOffset)
+        streamRequest = networkingClient.stream(request: urlRequest)
             .responseStream { [weak self] event in
                 guard let self = self else { return }
                 self.handleResponse(event: event)
             }
             .resume()
 
-        streamRequest = request
         metadataStreamProcessor.delegate = self
+    }
+
+    private func initialRequest(completion: @escaping () -> Void) {
+        let urlRequest = fetchUrlForPartialContent(with: url)
+        let task: NetworkDataStream = networkingClient.stream(request: urlRequest)
+        task.responseStream { [weak self] event in
+            switch event {
+            case let .response(urlResponse):
+                self?.parseResponseHeader(response: urlResponse)
+                task.cancel()
+                completion()
+            default:
+                break
+            }
+        }.resume()
+    }
+
+    private func handleMp4Files() {
+        mp4Restructure.optimizeIfNeeded { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case let .success(value):
+                if let value {
+                    self.addStreamOperation {
+                        let audioCount = self.processAudio(data: value.initialData)
+                        self.relativePosition += audioCount
+                    }
+                    self.doPerfomOpen(seek: value.mdatOffset)
+                } else {
+                    self.doPerfomOpen(seek: 0)
+                }
+            case let .failure(failure):
+                self.delegate?.errorOccurred(source: self, error: failure)
+            }
+        }
     }
 
     // MARK: - Network Handle Methods
@@ -181,65 +239,67 @@ public class RemoteAudioSource: AudioStreamSource {
         case let .response(urlResponse):
             parseResponseHeader(response: urlResponse)
             streamOperationQueue.isSuspended = false
-        case let .stream(event):
-            handleStreamEvent(event: event)
+        case let .stream(.success(response)):
+            handleSuccessfulStreamEvent(response: response)
+        case let .stream(.failure(error)):
+            handleFailedStreamEvent(error: error)
         case let .complete(event):
             if let error = event.error {
-                delegate?.errorOccured(source: self, error: error)
+                delegate?.errorOccurred(source: self, error: error)
             } else {
                 addCompletionOperation { [weak self] in
                     guard let self = self else { return }
-                    self.delegate?.endOfFileOccured(source: self)
+                    self.delegate?.endOfFileOccurred(source: self)
                 }
             }
         }
     }
 
-    private func handleStreamEvent(event: NetworkDataStream.StreamResult) {
-        switch event {
-        case let .success(value):
-            if let audioData = value.data {
-                addStreamOperation { [weak self] in
-                    guard let self = self else { return }
-                    if self.shouldTryParsingIcycastHeaders {
-                        let (header, extractedAudio) = self.icycastHeadersProcessor.proccess(data: audioData)
-                        if let header = header {
-                            self.shouldTryParsingIcycastHeaders = false
-                            let parser = IcycastHeaderParser()
-                            self.parsedHeaderOutput = parser.parse(input: header)
-                            if let metadataStep = self.parsedHeaderOutput?.metadataStep {
-                                self.metadataStreamProcessor.metadataAvailable(step: metadataStep)
-                            }
-
-                            let audioCount = self.processAudio(data: extractedAudio)
-                            self.relativePosition += audioCount
-                            return
-                        }
+    private func handleSuccessfulStreamEvent(response: NetworkDataStream.Response) {
+        guard let audioData = response.data else {
+            delegate?.errorOccurred(source: self, error: NetworkError.missingData)
+            return
+        }
+        addStreamOperation { [weak self] in
+            guard let self = self else { return }
+            if self.shouldTryParsingIcycastHeaders {
+                let (header, extractedAudio) = self.icycastHeadersProcessor.process(data: audioData)
+                if let header = header {
+                    self.shouldTryParsingIcycastHeaders = false
+                    let parser = IcycastHeaderParser()
+                    self.parsedHeaderOutput = parser.parse(input: header)
+                    if let metadataStep = self.parsedHeaderOutput?.metadataStep {
+                        self.metadataStreamProcessor.metadataAvailable(step: metadataStep)
                     }
-                    let audioCount = self.processAudio(data: audioData)
-                    self.relativePosition += audioCount
                 }
-            }
-        case .failure:
-            if !netStatusService.isConnected {
-                waitingForNetwork = true
+                let audioCount = self.processAudio(data: extractedAudio)
+                self.relativePosition += audioCount
                 return
             }
-            waitingForNetwork = false
-            retryOnError()
+            let audioCount = self.processAudio(data: audioData)
+            self.relativePosition += audioCount
         }
+    }
+
+    private func handleFailedStreamEvent(error _: Error) {
+        if !netStatusService.isConnected {
+            waitingForNetwork = true
+            return
+        }
+        waitingForNetwork = false
+        retryOnError()
     }
 
     /// Processing audio data, extracting metadata if needed.
     /// - Parameter data: The audio to be processed
     /// - Returns: An `Int` value representing the amount of audio data bytes.
     private func processAudio(data: Data) -> Int {
-        if self.metadataStreamProcessor.canProccessMetadata {
-            let extractedAudioData = self.metadataStreamProcessor.proccessMetadata(data: data)
-            self.delegate?.dataAvailable(source: self, data: extractedAudioData)
+        if metadataStreamProcessor.canProcessMetadata {
+            let extractedAudioData = metadataStreamProcessor.processMetadata(data: data)
+            delegate?.dataAvailable(source: self, data: extractedAudioData)
             return extractedAudioData.count
         } else {
-            self.delegate?.dataAvailable(source: self, data: data)
+            delegate?.dataAvailable(source: self, data: data)
             return data.count
         }
     }
@@ -256,11 +316,13 @@ public class RemoteAudioSource: AudioStreamSource {
             return
         }
 
-        if let acceptRanges = parser.value(forHTTPHeaderField: HeaderField.acceptRanges, in: response) {
+        if httpStatusCode == 206 {
+            supportsSeek = true
+        } else if let acceptRanges = parser.value(forHTTPHeaderField: HeaderField.acceptRanges, in: response) {
             supportsSeek = acceptRanges != "none"
         }
 
-        // check to see if we have metadata to proccess
+        // check to see if we have metadata to process
         if let metadataStep = parsedHeaderOutput?.metadataStep {
             metadataStreamProcessor.metadataAvailable(step: metadataStep)
         }
@@ -271,9 +333,12 @@ public class RemoteAudioSource: AudioStreamSource {
         // check for error
         if statusCode == 416 { // range not satisfied error
             if length >= 0 { seekOffset = length }
-            delegate?.endOfFileOccured(source: self)
+            delegate?.endOfFileOccurred(source: self)
         } else if statusCode >= 300 {
-            delegate?.errorOccured(source: self, error: NetworkError.serverError)
+            delegate?.errorOccurred(
+                source: self,
+                error: NetworkError.serverError
+            )
         }
     }
 
@@ -290,16 +355,32 @@ public class RemoteAudioSource: AudioStreamSource {
         urlRequest.addValue("1", forHTTPHeaderField: "Icy-MetaData")
         urlRequest.addValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
-        if supportsSeek && seekOffset > 0 {
+        if supportsSeek, seekOffset > 0 {
             urlRequest.addValue("bytes=\(seekOffset)-", forHTTPHeaderField: "Range")
         }
+        return urlRequest
+    }
+
+    private func fetchUrlForPartialContent(with url: URL) -> URLRequest {
+        var urlRequest = URLRequest(url: url)
+        urlRequest.networkServiceType = .avStreaming
+        urlRequest.cachePolicy = .reloadIgnoringLocalCacheData
+        urlRequest.timeoutInterval = 60
+
+        for header in additionalRequestHeaders {
+            urlRequest.addValue(header.value, forHTTPHeaderField: header.key)
+        }
+        urlRequest.addValue("*/*", forHTTPHeaderField: "Accept")
+        urlRequest.addValue("1", forHTTPHeaderField: "Icy-MetaData")
+        urlRequest.addValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        urlRequest.addValue("bytes=0-1", forHTTPHeaderField: "Range")
         return urlRequest
     }
 
     private func retryOnError() {
         retrierTimeout.retry { [weak self] in
             guard let self = self else { return }
-            self.seek(at: self.position)
+            self.seek(at: self.supportsSeek ? self.position : 0)
         }
     }
 
@@ -310,6 +391,7 @@ public class RemoteAudioSource: AudioStreamSource {
     /// - Parameter block: A closure to be executed
     private func addStreamOperation(_ block: @escaping () -> Void) {
         let operation = BlockOperation(block: block)
+        operation.qualityOfService = .userInitiated
         streamOperationQueue.addOperation(operation)
     }
 

@@ -5,31 +5,32 @@
 
 import Foundation
 
-internal final class AudioPlayerContext {
-    var stopReason = Protected<AudioPlayerStopReason>(.none)
+final class AudioPlayerContext {
+    var stopReason: Atomic<AudioPlayerStopReason>
 
-    var state = Protected<AudioPlayerState>(.ready)
+    var state: Atomic<AudioPlayerState>
     var stateChanged: ((_ oldState: AudioPlayerState, _ newState: AudioPlayerState) -> Void)?
 
-    var muted = Protected<Bool>(false)
+    var muted: Atomic<Bool>
 
     var internalState: AudioPlayer.InternalState {
         playerInternalState.value
     }
 
-    let entriesLock = UnfairLock()
+    let entriesLock: UnfairLock
     var audioReadingEntry: AudioEntry?
     var audioPlayingEntry: AudioEntry?
-
-    var disposedRequested: Bool
 
     /// This is the player's internal state to use
     /// - NOTE: Do not use directly instead use the `internalState` to set and get the property
     /// or the `setInternalState(to:when:)`method
-    private var playerInternalState = Protected<AudioPlayer.InternalState>(.initial)
+    private var playerInternalState = Atomic<AudioPlayer.InternalState>(.initial)
 
     init() {
-        disposedRequested = false
+        stopReason = Atomic<AudioPlayerStopReason>(.none)
+        state = Atomic<AudioPlayerState>(.ready)
+        muted = Atomic<Bool>(false)
+        entriesLock = UnfairLock()
     }
 
     /// Sets the internal state if given the `inState` will be evaluated before assignment occurs.
@@ -37,11 +38,13 @@ internal final class AudioPlayerContext {
     /// - parameter state: The new `PlayerInternalState`
     /// - parameter inState: If the `inState` expression is not nil, the internalState will be set if the evaluated expression is `true`
     /// - NOTE: This sets the underlying `__playerInternalState` variable
-    internal func setInternalState(to state: AudioPlayer.InternalState,
-                                   when inState: ((AudioPlayer.InternalState) -> Bool)? = nil)
+    func setInternalState(to state: AudioPlayer.InternalState,
+                          when inState: ((AudioPlayer.InternalState) -> Bool)? = nil)
     {
         let newValues = playerStateAndStopReason(for: state)
-        stopReason.write { $0 = newValues.stopReason }
+        if let stopReason = newValues.stopReason {
+            self.stopReason.write { $0 = stopReason }
+        }
         guard state != internalState else { return }
         if let inState = inState, !inState(internalState) {
             return
