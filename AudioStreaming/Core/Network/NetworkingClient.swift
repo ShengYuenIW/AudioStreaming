@@ -13,11 +13,14 @@ enum DataStreamError: Error {
 public enum NetworkError: Error, Equatable {
     case failure(Error)
     case serverError
+    case missingData
     public static func == (lhs: NetworkError, rhs: NetworkError) -> Bool {
         switch (lhs, rhs) {
         case (.failure, failure):
             return true
         case (.serverError, .serverError):
+            return true
+        case (.missingData, .missingData):
             return true
         default:
             return false
@@ -41,7 +44,7 @@ extension URLSessionConfiguration {
     }
 }
 
-internal final class NetworkingClient {
+final class NetworkingClient {
     let session: URLSession
     weak var delegate: NetworkSessionDelegate?
     let networkQueue: DispatchQueue
@@ -49,9 +52,9 @@ internal final class NetworkingClient {
     var tasksLock = UnfairLock()
     var tasks = BiMap<URLSessionTask, NetworkDataStream>()
 
-    internal init(configuration: URLSessionConfiguration = .networkingConfiguration,
-                  delegate: NetworkSessionDelegate = NetworkSessionDelegate(),
-                  networkQueue: DispatchQueue = DispatchQueue(label: "audio.streaming.session.network.queue"))
+    init(configuration: URLSessionConfiguration = .networkingConfiguration,
+         delegate: NetworkSessionDelegate = NetworkSessionDelegate(),
+         networkQueue: DispatchQueue = DispatchQueue(label: "audio.streaming.session.network.queue"))
     {
         let delegateQueue = operationQueue(underlyingQueue: networkQueue)
         let session = URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegateQueue)
@@ -67,22 +70,38 @@ internal final class NetworkingClient {
 
     /// Creates a data stream for the given `URLRequest`
     /// - parameter request: A `URLRequest` to be used for the data stream
-    internal func stream(request: URLRequest) -> NetworkDataStream {
+    func stream(request: URLRequest) -> NetworkDataStream {
         let stream = NetworkDataStream(id: UUID(), underlyingQueue: networkQueue)
         setupRequest(stream, request: request)
         return stream
     }
 
-    internal func remove(task: NetworkDataStream) {
-        tasksLock.lock(); defer { tasksLock.unlock() }
-        if !tasks.isEmpty {
-            tasks[task] = nil
+    func remove(task: NetworkDataStream) {
+        tasksLock.withLock {
+            if !tasks.isEmpty {
+                tasks[task] = nil
+            }
         }
+    }
+
+    @discardableResult
+    func task(request: URLRequest, completion: @escaping (Result<Data, Error>) -> Void) -> URLSessionDataTask {
+        let task = session.dataTask(with: request) { data, _, error in
+            if let error {
+                completion(Result<Data, Error>.failure(error))
+                return
+            }
+            if let data {
+                completion(Result<Data, Error>.success(data))
+            }
+        }
+        task.resume()
+        return task
     }
 
     // MARK: Private
 
-    /// Schedules the given `NetworkDataStream` to be performed immediatelly
+    /// Schedules the given `NetworkDataStream` to be performed immediately
     /// - parameter stream: The `NetworkDataStream` object to be performed
     /// - parameter request: The `URLRequest` for the `stream`
     private func setupRequest(_ stream: NetworkDataStream, request: URLRequest) {
@@ -96,14 +115,16 @@ internal final class NetworkingClient {
 // MARK: StreamTaskProvider conformance
 
 extension NetworkingClient: StreamTaskProvider {
-    internal func dataStream(for request: URLSessionTask) -> NetworkDataStream? {
-        tasksLock.lock(); defer { tasksLock.unlock() }
-        return tasks[request] ?? nil
+    func dataStream(for request: URLSessionTask) -> NetworkDataStream? {
+        tasksLock.withLock {
+            tasks[request] ?? nil
+        }
     }
 
-    internal func sessionTask(for stream: NetworkDataStream) -> URLSessionTask? {
-        tasksLock.lock(); defer { tasksLock.unlock() }
-        return tasks[stream] ?? nil
+    func sessionTask(for stream: NetworkDataStream) -> URLSessionTask? {
+        tasksLock.withLock {
+            tasks[stream] ?? nil
+        }
     }
 }
 

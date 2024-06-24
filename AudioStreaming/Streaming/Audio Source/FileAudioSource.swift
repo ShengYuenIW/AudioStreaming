@@ -3,6 +3,7 @@
 //  Copyright © 2020 Decimal. All rights reserved.
 //
 
+import Foundation
 import AVFoundation
 
 final class FileAudioSource: NSObject, CoreAudioStreamSource {
@@ -17,6 +18,12 @@ final class FileAudioSource: NSObject, CoreAudioStreamSource {
         audioFileType(fileExtension: url.pathExtension)
     }
 
+    private var isMp4: Bool {
+        audioFileHint == kAudioFileM4AType || audioFileHint == kAudioFileMPEG4Type
+    }
+
+    private var mp4IsAlreadyOptimized: Bool = false
+
     private var seekOffset: Int
 
     private let url: URL
@@ -25,6 +32,8 @@ final class FileAudioSource: NSObject, CoreAudioStreamSource {
     private var readSize: Int
     private var buffer: UnsafeMutablePointer<UInt8>
     private var inputStream: InputStream?
+
+    private var mp4Restructure: Mp4Restructure
 
     init(url: URL,
          fileManager: FileManager = .default,
@@ -35,6 +44,7 @@ final class FileAudioSource: NSObject, CoreAudioStreamSource {
         self.underlyingQueue = underlyingQueue
         self.fileManager = fileManager
         self.readSize = readSize
+        self.mp4Restructure = Mp4Restructure()
         buffer = UnsafeMutablePointer.uint8pointer(of: readSize)
         seekOffset = 0
         position = 0
@@ -43,6 +53,7 @@ final class FileAudioSource: NSObject, CoreAudioStreamSource {
 
     deinit {
         buffer.deallocate()
+        mp4Restructure.clear()
     }
 
     func close() {
@@ -54,12 +65,8 @@ final class FileAudioSource: NSObject, CoreAudioStreamSource {
         inputStream.delegate = nil
     }
 
-    func suspend() {
-        guard let inputStream = inputStream else {
-            return
-        }
-        CFReadStreamSetDispatchQueue(inputStream, nil)
-    }
+    // no-op
+    func suspend() {}
 
     func resume() {
         guard let inputStream = inputStream else {
@@ -69,40 +76,38 @@ final class FileAudioSource: NSObject, CoreAudioStreamSource {
     }
 
     func seek(at offset: Int) {
-        close()
-
         do {
             try performOpen(seek: offset)
         } catch {
-            delegate?.errorOccured(source: self, error: error)
+            delegate?.errorOccurred(source: self, error: error)
         }
     }
 
     private func performOpen(seek seekOffset: Int) throws {
-        guard let inputStream = InputStream(url: url) else {
-            throw AudioSystemError.playerStartError
-        }
-        self.inputStream = inputStream
-
         var reopened = false
-        let streamStatus = inputStream.streamStatus
-        if streamStatus == .notOpen || streamStatus == .error {
+        let status = inputStream?.streamStatus ?? .closed
+        if status == .atEnd || status == .closed || status == .error {
             reopened = true
             close()
-            open(inputStream: inputStream)
+            try open()
         }
 
-        let attributes = try fileManager.attributesOfItem(atPath: url.path)
-        length = (attributes[.size] as? Int) ?? 0
+        var offset = seekOffset
+        if isMp4, mp4Restructure.dataOptimized {
+            offset = mp4Restructure.seekAdjusted(offset: seekOffset)
+        }
 
-        if inputStream.setProperty(seekOffset, forKey: .fileCurrentOffsetKey) {
-            position = seekOffset
+        if inputStream?.setProperty(offset, forKey: .fileCurrentOffsetKey) == true {
+            position = offset
         } else {
             position = 0
         }
+
         if !reopened {
-            if inputStream.hasBytesAvailable {
-                dataAvailable()
+            underlyingQueue.async { [weak self] in
+                if self?.inputStream?.hasBytesAvailable == true {
+                    self?.dataAvailable()
+                }
             }
         }
     }
@@ -112,17 +117,62 @@ final class FileAudioSource: NSObject, CoreAudioStreamSource {
         let read = inputStream.read(buffer, maxLength: readSize)
         if read > 0 {
             let data = Data(bytes: buffer, count: read)
-            delegate?.dataAvailable(source: self, data: data)
+            if isMp4, !mp4IsAlreadyOptimized {
+                if !mp4Restructure.dataOptimized {
+                    do {
+                        if let mp4OptimizeInfo = try mp4Restructure.checkIsOptimized(data: data) {
+                            try performMp4Restructure(inputStream: inputStream, mp4OptimizeInfo: mp4OptimizeInfo)
+                        } else {
+                            mp4IsAlreadyOptimized = true
+                            delegate?.dataAvailable(source: self, data: data)
+                        }
+                    } catch {
+                        delegate?.errorOccurred(source: self, error: error)
+                    }
+                } else {
+                    delegate?.dataAvailable(source: self, data: data)
+                }
+            } else {
+                delegate?.dataAvailable(source: self, data: data)
+            }
             position += read
         } else {
             position += getCurrentOffsetFromStream()
         }
     }
 
-    private func open(inputStream: InputStream) {
+    func performMp4Restructure(inputStream: InputStream, mp4OptimizeInfo: Mp4OptimizeInfo) throws {
+        let offsetAccepted = inputStream.setProperty(mp4OptimizeInfo.moovOffset, forKey: .fileCurrentOffsetKey)
+        if offsetAccepted {
+            let moovDataBuffer = UnsafeMutablePointer.uint8pointer(of: mp4OptimizeInfo.moovSize)
+            defer { moovDataBuffer.deallocate() }
+            let moovRead = inputStream.read(moovDataBuffer, maxLength: mp4OptimizeInfo.moovSize)
+            if moovRead > 0 {
+                let data = Data(bytes: moovDataBuffer, count: moovRead)
+                let moovData = try mp4Restructure.restructureMoov(data: data)
+                delegate?.dataAvailable(source: self, data: moovData.initialData)
+                if !inputStream.setProperty(moovData.mdatOffset, forKey: .fileCurrentOffsetKey) {
+                    delegate?.errorOccurred(source: self, error: AudioSystemError.playerStartError)
+                }
+            } else {
+                delegate?.errorOccurred(source: self, error: AudioSystemError.playerStartError)
+            }
+        } else {
+            delegate?.errorOccurred(source: self, error: inputStream.streamError ?? AudioSystemError.playerStartError)
+        }
+    }
+
+    private func open() throws {
+        guard let inputStream = InputStream(url: url) else {
+            throw AudioSystemError.playerStartError
+        }
+        self.inputStream = inputStream
         CFReadStreamSetDispatchQueue(inputStream, underlyingQueue)
         inputStream.delegate = self
         inputStream.open()
+
+        let attributes = try fileManager.attributesOfItem(atPath: url.path)
+        length = (attributes[.size] as? Int) ?? 0
     }
 
     private func getCurrentOffsetFromStream() -> Int {
@@ -139,11 +189,9 @@ extension FileAudioSource: StreamDelegate {
         case .hasBytesAvailable:
             dataAvailable()
         case .endEncountered:
-            delegate?.endOfFileOccured(source: self)
+            delegate?.endOfFileOccurred(source: self)
         case .errorOccurred:
-            delegate?.errorOccured(source: self, error: AudioPlayerError.codecError)
-        case .endEncountered:
-            delegate?.endOfFileOccured(source: self)
+            delegate?.errorOccurred(source: self, error: AudioPlayerError.codecError)
         default:
             break
         }

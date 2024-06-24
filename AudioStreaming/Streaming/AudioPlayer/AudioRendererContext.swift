@@ -6,27 +6,25 @@
 import AVFoundation
 import CoreAudio
 
-internal var maxFramesPerSlice: AVAudioFrameCount = 8192
+var maxFramesPerSlice: AVAudioFrameCount = 8192
 
 final class AudioRendererContext {
-    var waiting = Protected<Bool>(false)
+    let waiting = Atomic<Bool>(false)
 
     let lock = UnfairLock()
 
     let bufferContext: BufferContext
 
-    var audioBuffer: AudioBuffer
-    var inOutAudioBufferList: UnsafeMutablePointer<AudioBufferList>
+    let audioBuffer: AudioBuffer
+    let inOutAudioBufferList: UnsafeMutablePointer<AudioBufferList>
 
     let packetsSemaphore = DispatchSemaphore(value: 0)
-
-    var discontinuous: Bool = false
 
     let framesRequiredToStartPlaying: UInt32
     let framesRequiredAfterRebuffering: UInt32
     let framesRequiredForDataAfterSeekPlaying: UInt32
 
-    var waitingForDataAfterSeekFrameCount = Protected<Int32>(0)
+    let waitingForDataAfterSeekFrameCount = Atomic<Int32>(0)
 
     private let configuration: AudioPlayerConfiguration
 
@@ -36,7 +34,7 @@ final class AudioRendererContext {
         let canonicalStream = outputAudioFormat.basicStreamDescription
 
         framesRequiredToStartPlaying = UInt32(canonicalStream.mSampleRate) * UInt32(configuration.secondsRequiredToStartPlaying)
-        framesRequiredAfterRebuffering = UInt32(canonicalStream.mSampleRate) * UInt32(configuration.secondsRequiredToStartPlayingAfterBufferUnderun)
+        framesRequiredAfterRebuffering = UInt32(canonicalStream.mSampleRate) * UInt32(configuration.secondsRequiredToStartPlayingAfterBufferUnderrun)
         framesRequiredForDataAfterSeekPlaying = UInt32(canonicalStream.mSampleRate) * UInt32(configuration.gracePeriodAfterSeekInSeconds)
 
         let dataByteSize = Int(canonicalStream.mSampleRate * configuration.bufferSizeInSeconds) * Int(canonicalStream.mBytesPerFrame)
@@ -77,8 +75,8 @@ private func allocateBufferList(dataByteSize: Int) -> UnsafeMutablePointer<Audio
     let _bufferList = AudioBufferList.allocate(maximumBuffers: 1)
 
     _bufferList[0].mDataByteSize = UInt32(dataByteSize)
-    let alingment = MemoryLayout<UInt8>.alignment
-    let mData = UnsafeMutableRawPointer.allocate(byteCount: dataByteSize, alignment: alingment)
+    let alignment = MemoryLayout<UInt8>.alignment
+    let mData = UnsafeMutableRawPointer.allocate(byteCount: dataByteSize, alignment: alignment)
     _bufferList[0].mData = mData
     _bufferList[0].mNumberChannels = 2
 

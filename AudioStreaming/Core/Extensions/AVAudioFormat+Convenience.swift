@@ -5,7 +5,7 @@
 
 import AVFoundation
 
-extension AVAudioFormat {
+public extension AVAudioFormat {
     /// The underlying audio stream description.
     ///
     /// This exposes the `pointee` value of the `UsafePointer<AudioStreamBasicDescription>`
